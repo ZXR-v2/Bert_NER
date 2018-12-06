@@ -42,8 +42,8 @@ if os.name == 'nt':
     bert_path = 'H:\迅雷下载\chinese_L-12_H-768_A-12\chinese_L-12_H-768_A-12'
     root_path = r'C:\workspace\python\BERT-BiLSMT-CRF-NER'
 else:
-    bert_path = '/home/macan/ml/data/chinese_L-12_H-768_A-12/'
-    root_path = '/home/macan/ml/workspace/BERT-BiLSMT-CRF-NER'
+    bert_path = '/home/public/BERT-BiLSMT-CRF-NER/chinese_L-12_H-768_A-12/'
+    root_path = '/home/public/BERT-BiLSMT-CRF-NER/output/msra_24_crf_result_dir/'
 
 flags.DEFINE_string(
     "data_dir", os.path.join(root_path, 'NERdata'),
@@ -168,7 +168,7 @@ class DataProcessor(object):
         """Gets a collection of `InputExample`s for the dev set."""
         raise NotImplementedError()
 
-    def get_labels(self):
+    def get_labels(self, data_dir):
         """Gets the list of labels for this data set."""
         raise NotImplementedError()
 
@@ -237,8 +237,21 @@ class NerProcessor(DataProcessor):
         return self._create_example(
             self._read_data(os.path.join(data_dir, "test.txt")), "test")
 
-    def get_labels(self):
-        return ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "X", "[CLS]", "[SEP]"]
+    def get_labels(self, data_dir):  # to be improved
+        return self._get_labels(
+            self._read_data(os.path.join(data_dir, "train.txt"))
+        )
+
+    def _get_labels(self, lines):
+        labels = set()
+        for line in lines:
+            for l in line[0].split():
+                labels.add(l)
+        labels = list(labels)
+        labels.insert(0, "[CLS]")
+        labels.insert(1, "[SEP]")
+        labels.insert(2, "X")
+        return labels
 
     def _create_example(self, lines, set_type):
         examples = []
@@ -287,6 +300,14 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, tokeni
     # 保存label->index 的map
     with codecs.open(os.path.join(FLAGS.output_dir, 'label2id.pkl'), 'wb') as w:
         pickle.dump(label_map, w)
+    eval_list_dir = os.path.join(FLAGS.output_dir, 'eval_ids_list.txt')
+    if not os.path.isfile(eval_list_dir):
+        eval_list = [ label_map[i] for i in label_list if i!='O' and i!='X' and i!="[CLS]" and i!="[SEP]"]
+        file=open(eval_list_dir, 'w')
+        for i in eval_list:
+            file.write(str(i) + '\n')
+        file.close()
+        print("Get the eval list in eval_tag_list.txt")
     textlist = example.text.split(' ')
     labellist = example.label.split(' ')
     tokens = []
@@ -546,11 +567,18 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
             def metric_fn(label_ids, logits, trans):
                 # 首先对结果进行维特比解码
                 # crf 解码
-
+                eval_list = []
+                assert True == os.path.exists(os.path.join(FLAGS.output_dir, "eval_ids_list.txt"))
+                list_file = open(os.path.join(FLAGS.output_dir, "eval_ids_list.txt"), 'r')
+                contents = list_file.readlines()
+                for item in contents:
+                    eval_list.append(int(item.strip())) ## 记得把字符转回来int类型，后面的评测都是基于int类型的list的
+                assert 0 < len(eval_list)
+                print("eval_list:", eval_list)
                 weight = tf.sequence_mask(FLAGS.max_seq_length)
-                precision = tf_metrics.precision(label_ids, pred_ids, num_labels, [2, 3, 4, 5, 6, 7], weight)
-                recall = tf_metrics.recall(label_ids, pred_ids, num_labels, [2, 3, 4, 5, 6, 7], weight)
-                f = tf_metrics.f1(label_ids, pred_ids, num_labels, [2, 3, 4, 5, 6, 7], weight)
+                precision = tf_metrics.precision(label_ids, pred_ids, num_labels, eval_list, weight)
+                recall = tf_metrics.recall(label_ids, pred_ids, num_labels, eval_list, weight)
+                f = tf_metrics.f1(label_ids, pred_ids, num_labels, eval_list, weight)
 
                 return {
                     "eval_precision": precision,
@@ -622,7 +650,7 @@ def main(_):
         raise ValueError("Task not found: %s" % (task_name))
     processor = processors[task_name]()
 
-    label_list = processor.get_labels()
+    label_list = processor.get_labels(FLAGS.data_dir)
 
     tokenizer = tokenization.FullTokenizer(
         vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
@@ -695,7 +723,7 @@ def main(_):
                 train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
         else:
             train_file = data_config.get('train.tf_record_path')
-        num_train_size = num_train_size = int(data_config['num_train_size'])
+        num_train_size = int(data_config['num_train_size'])
         tf.logging.info("***** Running training *****")
         tf.logging.info("  Num examples = %d", num_train_size)
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -742,9 +770,9 @@ def main(_):
                 writer.write("%s = %s\n" % (key, str(result[key])))
 
     # 保存数据的配置文件，避免在以后的训练过程中多次读取训练以及测试数据集，消耗时间
-    if not os.path.exists(FLAGS.data_config_path):
-        with codecs.open(FLAGS.data_config_path, 'a', encoding='utf-8') as fd:
-            json.dump(data_config, fd)
+    # if not os.path.exists(FLAGS.data_config_path):
+    #     with codecs.open(FLAGS.data_config_path, 'a', encoding='utf-8') as fd:
+    #         json.dump(data_config, fd)
 
     if FLAGS.do_predict:
         token_path = os.path.join(FLAGS.output_dir, "token_test.txt")
@@ -822,7 +850,7 @@ def main(_):
 
 def load_data():
     processer = NerProcessor()
-    processer.get_labels()
+    processer.get_labels(FLAGS.data_dir)
     example = processer.get_train_examples(FLAGS.data_dir)
     print()
 if __name__ == "__main__":
