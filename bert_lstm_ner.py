@@ -16,6 +16,7 @@ import collections
 import os
 import json
 import logging
+import time
 
 
 import tensorflow as tf
@@ -25,13 +26,13 @@ from tensorflow.contrib import estimator
 from bert import modeling
 from bert import optimization
 from bert import tokenization
-from lstm_crf_layer import BLSTM_CRF
+# from lstm_crf_layer import BLSTM_CRF
 from crf_layer import CRF
 
 import tf_metrics
 import pickle
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1' #"-1"即为禁用GPU，只使用CPU
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 flags = tf.flags
@@ -82,6 +83,8 @@ flags.DEFINE_integer(
 
 flags.DEFINE_boolean('clean', True, 'remove the files which created by last training')
 
+flags.DEFINE_bool("is_label", True, "Is the dataset labeled")
+
 flags.DEFINE_bool("do_train", True, "Whether to run training."
 )
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
@@ -89,6 +92,8 @@ flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 flags.DEFINE_bool("do_eval", True, "Whether to run eval on the dev set.")
 
 flags.DEFINE_bool("do_predict", False, "Whether to run the model in inference mode on the test set.")
+
+flags.DEFINE_bool("do_predict_eval", False, "Whether evaluate your test set during predict")
 
 flags.DEFINE_integer("train_batch_size", 64, "Total batch size for training.")
 
@@ -173,28 +178,36 @@ class DataProcessor(object):
         raise NotImplementedError()
 
     @classmethod
-    def _read_data(cls, input_file):
+    def _read_data(cls, input_file, batch_num = None):
         """Reads a BIO data."""
         with open(input_file) as f:
+            words_num = 0
             lines = []
             words = []
             labels = []
             for line in f:
                 contends = line.strip()
-                if len(contends) == 0:
-                    continue
-                word = line.strip().split()[0]
-                label = line.strip().split()[-1]
-                words.append(word)
-                labels.append(label)
-                if words[-1] == '！' or words[-1] == '。':
+                words_num += 1
+                if batch_num != None and words_num > batch_num:
+                    f.close()
+                    break
+                if len(contends) == 0: #去掉了以'。'和'！'作为判断条件
                     l = ' '.join([label for label in labels if len(label) > 0])
                     w = ' '.join([word for word in words if len(word) > 0])
                     lines.append([l, w])
                     words = []
                     labels = []
                     continue
-            return lines
+                word = line.strip().split()[0]
+                label = line.strip().split()[-1]
+                if label == word: #即只存在word不存在label，即只有数据无类标
+                    FLAGS.is_label = False
+                    labels.append('O') # 不存在label，则给它挂上一个不存在的label
+                else:
+                    labels.append(label)
+                words.append(word)
+            return (lines, words_num)
+
 
         # with codecs.open(input_file, 'r', encoding='utf-8') as f:
         #     lines = []
@@ -223,23 +236,29 @@ class DataProcessor(object):
 
 
 class NerProcessor(DataProcessor):
-    def get_train_examples(self, data_dir):
-        return self._create_example(
-            self._read_data(os.path.join(data_dir, "train.txt")), "train"
-        )
+    def get_train_examples(self, data_dir, batch_num=None):
+        train_examples = self._read_data(os.path.join(data_dir, "train.txt"),batch_num)
+        return self._create_example(train_examples[0] , "train"), train_examples[1]
 
-    def get_dev_examples(self, data_dir):
-        return self._create_example(
-            self._read_data(os.path.join(data_dir, "dev.txt")), "dev"
-        )
 
-    def get_test_examples(self, data_dir):
-        return self._create_example(
-            self._read_data(os.path.join(data_dir, "test.txt")), "test")
+    def get_dev_examples(self, data_dir, batch_num=None):
+        dev_examples = self._read_data(os.path.join(data_dir, "dev.txt"),batch_num)
+        return self._create_example(dev_examples[0], "dev"), dev_examples[1]
+
+
+    def get_test_examples(self, data_dir,batch_num=None):
+        test_examples = self._read_data(os.path.join(data_dir, "pku98-gold.txt"),batch_num)
+        return self._create_example(test_examples[0], "test"), test_examples[1]
+
 
     def get_labels(self, data_dir):  # to be improved
         return self._get_labels(
-            self._read_data(os.path.join(data_dir, "train.txt"))
+            self._read_data(os.path.join(data_dir, "train.txt"))[0]
+        )
+
+    def get_predict_labels(self, data_dir):  # to be improved
+        return self._get_labels(
+            self._read_data(os.path.join(data_dir, "pku98-gold.txt"))[0]
         )
 
     def _get_labels(self, lines):
@@ -282,7 +301,7 @@ def write_tokens(tokens, mode):
         wf.close()
 
 
-def convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, mode):
+def convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, mode, predict_label_list = None):
     """
     将一个样本进行分析，然后将字转化为id, 标签转化为id,然后结构化到InputFeatures对象中
     :param ex_index: index
@@ -294,15 +313,20 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, tokeni
     :return:
     """
     label_map = {}
-    # 1表示从1开始对label进行index化
-    for (i, label) in enumerate(label_list, 1):
-        label_map[label] = i
-    # 保存label->index 的map
-    with codecs.open(os.path.join(FLAGS.output_dir, 'label2id.pkl'), 'wb') as w:
-        pickle.dump(label_map, w)
+    if os.path.exists(os.path.join(FLAGS.output_dir, 'label2id.pkl')):
+        with codecs.open(os.path.join(FLAGS.output_dir, 'label2id.pkl'), 'rb') as rf:
+            label_map = pickle.load(rf)
+    else:
+        # 1表示从1开始对label进行index化
+        for (i, label) in enumerate(label_list, 1):
+            label_map[label] = i
+        # 保存label->index 的map
+        # print("the label map is", label_map)
+        with codecs.open(os.path.join(FLAGS.output_dir, 'label2id.pkl'), 'wb') as w:
+            pickle.dump(label_map, w)
     eval_list_dir = os.path.join(FLAGS.output_dir, 'eval_ids_list.txt')
-    if not os.path.isfile(eval_list_dir):
-        eval_list = [ label_map[i] for i in label_list if i!='O' and i!='X' and i!="[CLS]" and i!="[SEP]"]
+    if not os.path.exists(eval_list_dir):
+        eval_list = [ label_map[i] for i in predict_label_list if i!='O' and i!='X' and i!="[CLS]" and i!="[SEP]"]
         file=open(eval_list_dir, 'w')
         for i in eval_list:
             file.write(str(i) + '\n')
@@ -387,7 +411,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, tokeni
 
 
 def filed_based_convert_examples_to_features(
-        examples, label_list, max_seq_length, tokenizer, output_file, mode=None
+        examples, label_list, max_seq_length, tokenizer, output_file, mode=None, predict_label_list = None
 ):
     """
     将数据转化为TF_Record 结构，作为模型数据输入
@@ -405,7 +429,7 @@ def filed_based_convert_examples_to_features(
         if ex_index % 5000 == 0:
             tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
         # 对于每一个训练样本,
-        feature = convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, mode)
+        feature = convert_single_example(ex_index, example, label_list ,max_seq_length, tokenizer, mode, predict_label_list)
 
         def create_int_feature(values):
             f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
@@ -650,7 +674,21 @@ def main(_):
         raise ValueError("Task not found: %s" % (task_name))
     processor = processors[task_name]()
 
-    label_list = processor.get_labels(FLAGS.data_dir)
+    if os.path.exists(os.path.join(FLAGS.data_dir, "label_list.txt")):
+        label_list = []
+        with codecs.open(os.path.join(FLAGS.data_dir,'label_list.txt'), 'r', encoding='utf-8') as f:
+            for line in f.readlines():
+                label_list.append(line.strip())
+            f.close()
+    else :
+        label_list = processor.get_labels(FLAGS.data_dir)
+        with codecs.open(os.path.join(FLAGS.data_dir,'label_list.txt'), 'w', encoding='utf-8') as f:
+            for label in label_list:
+                f.write(label + '\n')
+            f.close()
+    print("the label list is:", label_list)
+    predict_label_list = processor.get_predict_labels(FLAGS.data_dir)
+    print("predict_label_list",predict_label_list)
 
     tokenizer = tokenization.FullTokenizer(
         vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
@@ -684,7 +722,7 @@ def main(_):
     if FLAGS.do_train:
         # 加载训练数据
         if len(data_config) == 0:
-            train_examples = processor.get_train_examples(FLAGS.data_dir)
+            train_examples, train_examples_num = processor.get_train_examples(FLAGS.data_dir)
             num_train_steps = int(
                 len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
             num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
@@ -720,7 +758,7 @@ def main(_):
         if data_config.get('train.tf_record_path', '') == '':
             train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
             filed_based_convert_examples_to_features(
-                train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
+                train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, predict_label_list=predict_label_list)
         else:
             train_file = data_config.get('train.tf_record_path')
         num_train_size = int(data_config['num_train_size'])
@@ -738,10 +776,10 @@ def main(_):
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
     if FLAGS.do_eval:
         if data_config.get('eval.tf_record_path', '') == '':
-            eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+            eval_examples, eval_examples_number = processor.get_dev_examples(FLAGS.data_dir)
             eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
             filed_based_convert_examples_to_features(
-                eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
+                eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, predict_label_list)
             data_config['eval.tf_record_path'] = eval_file
             data_config['num_eval_size'] = len(eval_examples)
         else:
@@ -783,69 +821,120 @@ def main(_):
             label2id = pickle.load(rf)
             id2label = {value: key for key, value in label2id.items()}
 
-        predict_examples = processor.get_test_examples(FLAGS.data_dir)
-        predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-        filed_based_convert_examples_to_features(predict_examples, label_list,
-                                                 FLAGS.max_seq_length, tokenizer,
-                                                 predict_file, mode="test")
+        print("label2id is", label2id)
+        print("id2label is", id2label)
 
-        tf.logging.info("***** Running prediction*****")
-        tf.logging.info("  Num examples = %d", len(predict_examples))
-        tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
-        if FLAGS.use_tpu:
-            # Warning: According to tpu_estimator.py Prediction on TPU is an
-            # experimental feature and hence not supported here
-            raise ValueError("Prediction in TPU not supported")
-        predict_drop_remainder = True if FLAGS.use_tpu else False
-        predict_input_fn = file_based_input_fn_builder(
-            input_file=predict_file,
-            seq_length=FLAGS.max_seq_length,
-            is_training=False,
-            drop_remainder=predict_drop_remainder)
+        batch_size = 0
+        i = 0 #用来标注第几轮
 
-        predicted_result = estimator.evaluate(input_fn=predict_input_fn)
-        output_eval_file = os.path.join(FLAGS.output_dir, "predicted_results.txt")
-        with codecs.open(output_eval_file, "w", encoding='utf-8') as writer:
-            tf.logging.info("***** Predict results *****")
-            for key in sorted(predicted_result.keys()):
-                tf.logging.info("  %s = %s", key, str(predicted_result[key]))
-                writer.write("%s = %s\n" % (key, str(predicted_result[key])))
+        f = open(os.path.join(FLAGS.data_dir, "pku98-gold.txt"))
+        CharNum = sum([len(word) for line in f for word in line.strip().split()])
+        f.close()
 
-        result = estimator.predict(input_fn=predict_input_fn)
-        output_predict_file = os.path.join(FLAGS.output_dir, "label_test.txt")
+        speed_writer = open(os.path.join(FLAGS.output_dir, "speed_evaluate.txt"), 'w', encoding='utf-8')
+        while batch_size < CharNum:
+            batch_size += 100000
+            i += 1
+            print("Start do it")
 
-        def result_to_pair(writer):
-            for predict_line, prediction in zip(predict_examples, result):
-                idx = 0
-                line = ''
-                line_token = str(predict_line.text).split(' ')
-                label_token = str(predict_line.label).split(' ')
-                if len(line_token) != len(label_token):
-                    tf.logging.info(predict_line.text)
-                    tf.logging.info(predict_line.label)
-                for id in prediction:
-                    if id == 0:
-                        continue
-                    curr_labels = id2label[id]
-                    if curr_labels in ['[CLS]', '[SEP]']:
-                        continue
-                    # 不知道为什么，这里会出现idx out of range 的错误。。。do not know why here cache list out of range exception!
-                    try:
-                        line += line_token[idx] + ' ' + label_token[idx] + ' ' + curr_labels + '\n'
-                    except Exception as e:
-                        tf.logging.info(e)
+            predict_examples, predict_examples_number = processor.get_test_examples(FLAGS.data_dir, batch_size)
+            predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record_1")
+            filed_based_convert_examples_to_features(predict_examples, label_list,
+                                                     FLAGS.max_seq_length, tokenizer,
+                                                     predict_file, mode="test", predict_label_list=predict_label_list)
+            file_size = os.path.getsize(os.path.join(FLAGS.data_dir, 'pku98-gold.txt')) / 1000
+            tf.logging.info("***** Running prediction*****")
+            tf.logging.info("  Num examples = %d", len(predict_examples))
+            tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+            tf.logging.info(" Character Number = %d", predict_examples_number)
+            tf.logging.info(" The size of file = %.2f kB" % file_size)
+            if FLAGS.use_tpu:
+                # Warning: According to tpu_estimator.py Prediction on TPU is an
+                # experimental feature and hence not supported here
+                raise ValueError("Prediction in TPU not supported")
+            predict_drop_remainder = True if FLAGS.use_tpu else False
+            predict_input_fn = file_based_input_fn_builder(
+                input_file=predict_file,
+                seq_length=FLAGS.max_seq_length,
+                is_training=False,
+                drop_remainder=predict_drop_remainder)
+
+            if FLAGS.do_predict_eval and FLAGS.is_label:
+                predicted_result = estimator.evaluate(input_fn=predict_input_fn)
+                predict_eval_file = "predicted_results_%03d.txt" % i
+                output_eval_file = os.path.join(FLAGS.output_dir, predict_eval_file)
+                with codecs.open(output_eval_file, "w", encoding='utf-8') as writer:
+                    tf.logging.info("***** Predict results *****")
+                    for key in sorted(predicted_result.keys()):
+                        tf.logging.info("  %s = %s", key, str(predicted_result[key]))
+                        writer.write("%s = %s\n" % (key, str(predicted_result[key])))
+
+            #开始计时
+            start_time = time.time()
+
+            result = estimator.predict(input_fn=predict_input_fn)
+            #停止计时
+            stop_time = time.time()
+            time_cost = (stop_time - start_time) * 1000
+
+            char_speed = batch_size / time_cost
+            byte_speed = file_size / time_cost
+
+            predict_file = "label_test_%03d.txt" % i
+            output_predict_file = os.path.join(FLAGS.output_dir, predict_file)
+
+            def result_to_pair(writer):
+                for predict_line, prediction in zip(predict_examples, result):
+                    idx = 0
+                    line = ''
+                    line_token = str(predict_line.text).split(' ')
+                    label_token = str(predict_line.label).split(' ')
+                    if len(line_token) != len(label_token):
                         tf.logging.info(predict_line.text)
                         tf.logging.info(predict_line.label)
-                        line = ''
-                        break
-                    idx += 1
-                writer.write(line + '\n')
+                    for id in prediction:
+                        if id == 0:
+                            continue
+                        curr_labels = id2label[id]
+                        if curr_labels in ['[CLS]', '[SEP]']:
+                            continue
+                        # 不知道为什么，这里会出现idx out of range 的错误。。。do not know why here cache list out of range exception!
+                        try:
+                            if FLAGS.is_label:
+                                line += line_token[idx] + ' ' + label_token[idx] + ' ' + curr_labels + '\n'
+                            else:
+                                line += line_token[idx] + ' ' + curr_labels + '\n'
+                        except Exception as e:
+                            tf.logging.info(e)
+                            tf.logging.info(predict_line.text)
+                            tf.logging.info(predict_line.label)
+                            line = ''
+                            break
+                        idx += 1
+                    writer.write(line + '\n')
 
-        with codecs.open(output_predict_file, 'w', encoding='utf-8') as writer:
-            result_to_pair(writer)
-        from conlleval import return_report
-        eval_result = return_report(output_predict_file)
-        print(eval_result)
+            with codecs.open(output_predict_file, 'w', encoding='utf-8') as writer:
+                result_to_pair(writer)
+
+
+            print("字符数：%d 耗费时间：%dms 速度：%.3f字符/ms" % (batch_size, time_cost, char_speed))
+            speed_writer.write("字符数：%d 耗费时间：%dms 速度：%.3f字符/ms \n" % (batch_size, time_cost, char_speed))
+            if batch_size > CharNum:
+                print("字节数：%.3fk 耗费时间：%dms 速度：%.3fk/ms" % (file_size, time_cost, byte_speed))
+                speed_writer.write("字节数：%.3fk 耗费时间：%dms 速度：%.3fk/ms \n" % (file_size, time_cost, byte_speed))
+
+            if FLAGS.do_predict_eval and FLAGS.is_label:
+                from conlleval import return_report
+                eval_result = return_report(output_predict_file)
+                tf.logging.info("***** Colleval Predict results *****")
+                print(eval_result)
+                eval_result_str = ' '.join(eval_result)
+                predict_conlleval_file = "predicted_conlleval_results_%03d.txt" % i
+                output_predict_eval_file = os.path.join(FLAGS.output_dir, predict_conlleval_file)
+                with codecs.open(output_predict_eval_file, "w", encoding='utf-8') as writer:
+                    writer.write(eval_result_str)
+                    writer.close()
+        speed_writer.close()
 
 
 def load_data():
